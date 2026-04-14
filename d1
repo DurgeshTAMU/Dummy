@@ -1,0 +1,622 @@
+# Complementary Masking in LLaDA: Complete Detailed Explanation
+
+## Overview
+
+Complementary masking is a **dual-path masking strategy** where the model is trained on two **complementary masked versions** of the same sequence. This is one of the key innovations in LLaDA that improves model robustness and bidirectional context understanding.
+
+---
+
+## Part 1: Understanding "Complementary" Concept
+
+### Simple Example
+
+Imagine we have a sequence of 10 tokens (positions 0-9) and want to mask 5 of them in the middle block (positions 5-9):
+
+```
+Original sequence:     [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8]  [9]
+                       |    |    |    |    | PROMPT | RESPONSE BLOCK |
+
+After random masking:
+seg_mask pattern:      F    F    F    F    F    T    F    T    F    T
+                       (False = don't mask, True = mask)
+                       
+Forward masking:       [0]  [1]  [2]  [3]  [4] [M]  [6] [M]  [8] [M]
+                       positions 5,7,9 are masked (where seg_mask=True)
+
+Complementary mask:    ~seg_mask = T    T    T    T    T    F    T    F    T    F
+                       (Inverse!)
+                       
+Complementary masking: [M]  [M]  [M]  [M]  [M]  [5]  [M]  [7]  [M]  [9]
+                       positions 5,7,9 are VISIBLE (where ~seg_mask=False)
+```
+
+**KEY INSIGHT**: The two masks are complements - they cover different positions!
+
+---
+
+## Part 2: Line-by-Line Code Walkthrough
+
+### Step 1: Initialize Masks (Lines 96-99)
+
+```python
+noisy_batch = input_ids.clone()           # Clone 1 for forward masking
+noisy_batch_rev = input_ids.clone()       # Clone 2 for complementary masking
+masked_indices = torch.zeros_like(input_ids, dtype=torch.bool)
+masked_indices_rev = torch.zeros_like(input_ids, dtype=torch.bool)
+```
+
+**What happens:**
+- `noisy_batch`: Will have [MASK] tokens where `masked_indices=True`
+- `noisy_batch_rev`: Will have [MASK] tokens where `masked_indices_rev=True`
+- `masked_indices`: Boolean mask marking positions to mask in forward path
+- `masked_indices_rev`: Boolean mask marking positions to mask in complementary path
+
+---
+
+### Step 2: Preserve Prompts (Lines 101-107)
+
+```python
+# Create position matrix [B, L] where each position knows its index
+token_positions = torch.arange(l, device=device).expand(b, l)
+#  Positions:    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...]
+#  Batch 0:      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...]
+#  Batch 1:      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...]
+
+# Create prompt mask: positions < prompt_length are prompts
+prompt_mask = token_positions < prompt_lengths.unsqueeze(1)
+# Example: if prompt_lengths=[5, 6]
+#  Batch 0: [T, T, T, T, T, F, F, F, F, F, ...]  (first 5 are prompt)
+#  Batch 1: [T, T, T, T, T, T, F, F, F, F, ...]  (first 6 are prompt)
+
+# NEVER mask prompts - keep them visible in both paths
+noisy_batch[prompt_mask] = input_ids[prompt_mask]
+noisy_batch_rev[prompt_mask] = input_ids[prompt_mask]
+```
+
+**Why**: Prompts should always be visible to the model - we want to mask only response tokens.
+
+---
+
+### Step 3: Random Masking Pattern Generation (Lines 110-134)
+
+```python
+for i in range(b):  # For each sequence in batch
+    prompt_len = prompt_lengths[i].item()      # Get prompt length
+    response_len = l - prompt_len               # Calculate response length
+    
+    if response_len > 0:
+        # BLOCKWISE: Divide response into blocks
+        max_blocks = response_len // block_size
+        # Example: if response_len=96 and block_size=32
+        #          max_blocks = 96 // 32 = 3 blocks
+        
+        # Randomly select HOW MANY blocks to mask
+        num_blocks_to_mask = random.randint(0, max_blocks)
+        # Example: num_blocks_to_mask could be 0, 1, 2, or 3
+        
+        num_tokens_to_mask = num_blocks_to_mask * block_size
+        # Example: if num_blocks_to_mask=1, then num_tokens_to_mask=32
+        
+        # Calculate which BLOCK to mask
+        mask_start = prompt_len + num_tokens_to_mask
+        # Block 0: [prompt_len, prompt_len + 32]
+        # Block 1: [prompt_len + 32, prompt_len + 64]
+        # Block 2: [prompt_len + 64, prompt_len + 96]
+        # We select one block randomly
+        
+        if num_blocks_to_mask == max_blocks:
+            mask_end = l  # If masking last block, go to end
+        else:
+            mask_end = mask_start + block_size  # Otherwise, one block size
+```
+
+**Visual Example:**
+
+```
+Sequence length: 384 tokens
+Prompt length: 100 tokens
+Response length: 284 tokens
+Block size: 32 tokens
+
+Response blocks:
+  Block 0: [100, 131]   (32 tokens)
+  Block 1: [132, 163]   (32 tokens)
+  Block 2: [164, 195]   (32 tokens)
+  Block 3: [196, 227]   (32 tokens)
+  ... (8 blocks total)
+
+Randomly select block 2: mask_start=164, mask_end=196
+This is the region we'll apply complementary masking to
+```
+
+---
+
+### Step 4: Random Token Masking Within Block (Lines 128-134)
+
+This is the CRITICAL PART where "complementary" happens:
+
+```python
+# Set masking ratio (default 50%)
+t = torch.full((b,), 0.5, device=input_ids.device)
+# Result: [0.5, 0.5, 0.5, ...]  (one per sequence in batch)
+
+# Add small eps for numerical stability
+p_mask = (1 - eps) * t + eps
+# Result: [0.4997, 0.4997, 0.4997, ...]
+
+# Broadcast to segment length
+seg_len = mask_end - mask_start  # e.g., 32 tokens
+p_mask = p_mask[:, None].repeat(1, seg_len)
+# Shape: [batch_size, seg_len]
+# Example: [[0.4997, 0.4997, ..., 0.4997],   # 32 values for seq 0
+#           [0.4997, 0.4997, ..., 0.4997]]  # 32 values for seq 1
+
+# RANDOM BINARY MASK: each position has 50% chance of being True
+seg_mask = torch.rand((b, seg_len), device=input_ids.device) < p_mask
+# Shape: [batch_size, seg_len]
+# Example result for seq 0 (32 positions):
+#   [T, F, T, F, F, T, T, F, ...]
+#   Some True (50%), some False (50%)
+```
+
+**Key Insight**: `seg_mask` is a **random binary pattern**. It's what we'll use to create complementary masks!
+
+---
+
+### Step 5: Creating Complementary Masks (Lines 133-134)
+
+This is the MAGIC LINE:
+
+```python
+# FORWARD MASKING PATH
+masked_indices[:, mask_start:mask_end] = seg_mask
+# masked_indices[i, 164:196] = [T, F, T, F, F, T, T, F, ...]
+# (True = position will be masked)
+
+# COMPLEMENTARY MASKING PATH ← THE KEY!
+masked_indices_rev[:, mask_start:mask_end] = ~seg_mask
+# masked_indices_rev[i, 164:196] = [F, T, F, T, T, F, F, T, ...]
+# (Inverse! False = position will be masked)
+#            ↑
+#      This ~ means NOT/INVERSE
+```
+
+**Visual Comparison:**
+
+```
+Original block (positions 164-195):
+  Tokens:           [t1, t2, t3, t4, t5, t6, t7, t8, ...]
+  
+Forward path (masked_indices):
+  seg_mask:         [T,  F,  T,  F,  F,  T,  T,  F, ...]
+  visible tokens:   [X,  t2, X,  t4, t5, X,  X,  t8, ...]  (X = masked)
+  noisy_batch:      [M,  t2, M,  t4, t5, M,  M,  t8, ...]
+
+Complementary path (masked_indices_rev = ~seg_mask):
+  ~seg_mask:        [F,  T,  F,  T,  T,  F,  F,  T, ...]
+  visible tokens:   [t1, X,  t3, X,  X,  t6, t7, X, ...]  (X = masked)
+  noisy_batch_rev:  [t1, M,  t3, M,  M,  t6, t7, M, ...]
+
+↓ COMPLEMENTARY! ↓
+In forward path:  positions 0,2,5,6 are MASKED,   1,3,4,7 are VISIBLE
+In rev path:      positions 0,2,5,6 are VISIBLE,  1,3,4,7 are MASKED
+```
+
+---
+
+### Step 6: Applying Masks to Create Noisy Sequences (Lines 136-140)
+
+```python
+# FORWARD PATH: Replace positions where masked_indices=True with [MASK]
+noisy_batch = torch.where(masked_indices, 126336, input_ids)
+#                                ↑ 126336 is [MASK] token ID
+# Result: Positions with True in masked_indices become [MASK] token
+# Other positions keep original tokens
+
+# Also mask everything AFTER the current block
+noisy_batch[i, mask_end:l] = mask_token_id
+# Why? Because semi-autoregressive only generates current block,
+#      so future tokens should be masked
+
+# COMPLEMENTARY PATH: Same but with inverse mask
+noisy_batch_rev = torch.where(masked_indices_rev, 126336, input_ids)
+#                                      ↑ INVERSE mask
+# Result: Different positions become [MASK]!
+
+noisy_batch_rev[i, mask_end:l] = mask_token_id
+# Mask future tokens here too
+```
+
+**Result Visualization:**
+
+```
+Original sequence:
+  Input: [...prompt tokens...] [t1] [t2] [t3] [t4] [t5] [t6] [t7] [t8] [future...]
+
+After forward masking (noisy_batch):
+  noisy:  [...prompt tokens...] [M]  [t2] [M]  [t4] [t5] [M]  [M]  [t8] [M]...[M]
+                                  ^   ^   ^   ^   ^   ^   ^   ^   ^                    
+                                  positions 0,2,5,6 masked
+
+After complementary masking (noisy_batch_rev):
+  noisy_rev: [...prompt tokens...] [t1] [M]  [t3] [M]  [M]  [t6] [t7] [M]  [M]...[M]
+                                  ^   ^   ^   ^   ^   ^   ^   ^   ^
+                                  positions 1,3,4,7 masked (OPPOSITE!)
+```
+
+---
+
+## Part 3: Training with Both Masks (Lines 155-258)
+
+### Forward Pass - Two Model Calls (Lines 165-170)
+
+```python
+def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    input_ids = inputs["input_ids"]
+    prompt_lengths = inputs["prompt_lengths"]
+
+    # Create both noisy versions
+    noisy_batch, noisy_batch_rev, masked_indices, masked_indices_rev = \
+        forward_process_semi_ar(input_ids, prompt_lengths, ...)
+
+    # ===== TWO SEPARATE MODEL CALLS =====
+    
+    # FORWARD PATH (mask positions in masked_indices)
+    outputs = model(input_ids=noisy_batch)
+    logits = outputs.logits
+    # Model tries to predict: What tokens should replace [MASK]?
+    # It sees: [...prompt...] [M] [t2] [M] [t4] [t5] [M] [M] [t8] [M]...[M]
+    # It should predict: t1 for position 0, t3 for position 2, etc.
+
+    # COMPLEMENTARY PATH (mask different positions in masked_indices_rev)
+    outputs_rev = model(input_ids=noisy_batch_rev)
+    logits_rev = outputs_rev.logits
+    # Model tries to predict: What tokens should replace [MASK]?
+    # It sees: [...prompt...] [t1] [M] [t3] [M] [M] [t6] [t7] [M] [M]...[M]
+    # It should predict: t2 for position 1, t4 for position 3, etc.
+```
+
+**Why Two Calls?**
+1. **Information**: Model sees different visible context in each path
+2. **Robustness**: Training on complementary masks makes model robust to any mask pattern
+3. **Bidirectional**: Model learns to use both left and right context
+
+---
+
+### Loss Calculation - Dual Loss Components
+
+#### Forward Path Loss (Lines 173-187)
+
+```python
+if masked_indices.sum() > 0:  # If there are masked positions
+    # Extract predictions at MASKED positions only
+    masked_logits = logits[masked_indices]
+    # Shape: [num_masked_tokens, vocab_size]
+    # Only keep logits where masked_indices=True
+    
+    # Get ground truth for masked positions
+    masked_labels = input_ids[masked_indices]
+    # These are the ACTUAL tokens that should be at masked positions
+    
+    # Cross-entropy loss: How wrong was the model?
+    token_loss = F.cross_entropy(
+        masked_logits,           # Model predictions
+        masked_labels,           # Ground truth
+        reduction='none'         # Keep per-token loss
+    )
+    
+    # Average over all masked tokens
+    ce_loss = torch.sum(token_loss) / masked_indices.sum()
+```
+
+**Example Calculation:**
+
+```
+noisy_batch:        [M]    [t2]   [M]    [t4]   ...
+Ground truth:       [t1]   [t2]   [t3]   [t4]   ...
+masked_indices:     [T]    [F]    [T]    [F]    ...
+
+masked_logits:      [[vocab distribution for position 0],
+                     [vocab distribution for position 2]]
+
+masked_labels:      [t1, t3]  (actual tokens at positions 0, 2)
+
+CE Loss:            -log(P(t1|position_0_context)) 
+                    -log(P(t3|position_2_context))
+                    ÷ 2 (average)
+```
+
+#### Complementary Path Loss (Lines 191-205)
+
+```python
+if masked_indices_rev.sum() > 0:
+    # EXACT SAME COMPUTATION but for DIFFERENT positions!
+    masked_logits_rev = logits_rev[masked_indices_rev]
+    # Extract from positions where masked_indices_rev=True
+    # This is DIFFERENT set of positions than forward path!
+    
+    masked_labels_rev = input_ids[masked_indices_rev]
+    
+    token_loss_rev = F.cross_entropy(
+        masked_logits_rev,
+        masked_labels_rev,
+        reduction='none'
+    )
+    
+    ce_loss_rev = torch.sum(token_loss_rev) / masked_indices_rev.sum()
+```
+
+**Key Difference:**
+
+```
+Forward path:
+  Masks positions:        [0, 2, 5, 6]
+  Predicts from context:  [t2, t4, t8]  and prompts
+  Loss from positions:    [0, 2, 5, 6]
+
+Complementary path:
+  Masks positions:        [1, 3, 4, 7]  ← DIFFERENT!
+  Predicts from context:  [t1, t3, t5]  and prompts
+  Loss from positions:    [1, 3, 4, 7]  ← DIFFERENT!
+```
+
+---
+
+### Entropy Regularization - Also Dual (Lines 208-252)
+
+The code also applies entropy minimization, **also for both paths**:
+
+```python
+# FORWARD PATH ENTROPY LOSS
+if masked_indices.sum() > 0:
+    probs = F.softmax(logits / self.temperature, dim=-1)
+    # Probability distribution for each token
+    
+    H_tok = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+    # Entropy: How uncertain is the model?
+    
+    pred_ids = logits.argmax(dim=-1)
+    # Model's best guess for each position
+    
+    correct_mask = (pred_ids == input_ids) & masked_indices
+    # Where did model guess CORRECTLY AND position was masked?
+    
+    if num_correct.item() > 0:
+        # ONLY for correct predictions: minimize entropy
+        entropy_loss = (H_tok * correct_mask).sum() / num_correct.clamp_min(1)
+        # Goal: Be MORE confident in correct predictions
+```
+
+**Why?** For correct predictions, we want the model to be **confident** (low entropy).
+
+#### Complementary Path Entropy Loss (Lines 232-252)
+
+```python
+# EXACT SAME but for rev path, different positions, different context
+if masked_indices_rev.sum() > 0:
+    probs_rev = F.softmax(logits_rev / self.temperature, dim=-1)
+    H_tok_rev = -(probs_rev * torch.log(probs_rev + 1e-12)).sum(dim=-1)
+    pred_ids_rev = logits_rev.argmax(dim=-1)
+    correct_mask_rev = (pred_ids_rev == input_ids) & masked_indices_rev
+    # ...
+```
+
+---
+
+### Final Combined Loss (Line 256)
+
+```python
+total_loss = ce_loss + ce_loss_rev + self.entropy_weight*(entropy_loss + entropy_loss_rev)
+#            ↑       ↑                ↑                 ↑
+#      Forward  Complementary  Forward Entropy   Complementary Entropy
+#        CE        CE Loss       Loss             Loss
+#
+# This is 4 loss terms!
+# Each trains the model on DIFFERENT masked positions
+```
+
+**Loss Breakdown:**
+
+```
+Total Loss = 4 components:
+
+1. ce_loss:           Model predicts [t1, t3, ...] from context [M, t2, M, ...]
+2. ce_loss_rev:       Model predicts [t2, t4, ...] from context [t1, M, t3, ...]
+3. entropy_loss:      Confidence in correct predictions from path 1
+4. entropy_loss_rev:  Confidence in correct predictions from path 2
+
+Together, they:
+- Train on ALL positions (each position appears in exactly one path as masked)
+- Train with bidirectional context (different visible tokens each time)
+- Encourage confidence in correct predictions
+```
+
+---
+
+## Part 4: Why Complementary Masking Works
+
+### Benefit 1: Covers All Positions
+
+```
+Example with 3 tokens [a, b, c]:
+
+Forward path:  mask 50%  → [M, b, c]   (trains to predict 'a')
+Rev path:      mask other → [a, M, c]  (trains to predict 'b')
+
+With multiple iterations, EVERY position gets trained as both:
+- A masked position to predict (learns to generate)
+- A visible position for context (learns to understand)
+```
+
+### Benefit 2: Bidirectional Context
+
+```
+Predicting token at position i:
+
+Forward path:   visible context = [visible_left] [MASK] [visible_right]
+                Uses both left and right context!
+
+Complementary:  visible context = [different_left] [MASK] [different_right]
+                Different combination of left/right context!
+
+Result: Model learns from DIVERSE context combinations
+```
+
+### Benefit 3: Robustness
+
+```
+At inference, model can handle:
+- If some positions are masked
+- If other positions are masked
+- Any combination!
+
+Because during training, it saw both scenarios for each token.
+```
+
+### Benefit 4: Data Efficiency
+
+```
+One input_ids sequence → Two training examples:
+  Example 1: noisy_batch with masked_indices
+  Example 2: noisy_batch_rev with masked_indices_rev
+
+Doubles the effective training data! (Without storing extra data)
+```
+
+---
+
+## Part 5: Complete Visual Example
+
+### Starting Sequence
+
+```
+Input sequence (length 12, prompt_len=5):
+Prompt:         Response:
+[p0][p1][p2][p3][p4] | [r0][r1][r2][r3][r4][r5][r6]
+ 0   1   2   3   4   |  5   6   7   8   9  10  11
+```
+
+### Masking Configuration
+
+```
+Block size: 2 tokens
+Selected block: positions 7-9 (3 tokens for this batch)
+seg_mask pattern (random): [T, F, T]
+```
+
+### Forward Path
+
+```
+seg_mask:                    [T, F, T]
+masked_indices at [7:10]:    [T, F, T]
+noisy_batch:      [p0][p1][p2][p3][p4][r0][r1][M ][r2][M ][M ][M ]
+                                                ↑      ↑     
+                                            masked   masked
+
+Forward Pass:
+  Model Input:  [p0][p1][p2][p3][p4][r0][r1][M ][r2][M ][M ][M ]
+  Model sees:   context from positions 0-11 with masks
+  Model predicts: Position 7 should be [r3], Position 9 should be [r4]
+  
+Loss Calculation:
+  Extracts logits at positions [7, 9] (where masked_indices=True)
+  Compares with ground truth [r3, r4]
+  Computes cross-entropy loss
+```
+
+### Complementary Path
+
+```
+~seg_mask:                     [F, T, F]
+masked_indices_rev at [7:10]:  [F, T, F]
+noisy_batch_rev:  [p0][p1][p2][p3][p4][r0][r1][r3][r2][r4][M ][M ]
+                                                          ↑
+                                                      masked
+
+Complementary Pass:
+  Model Input:  [p0][p1][p2][p3][p4][r0][r1][r3][r2][r4][M ][M ]
+  Model sees:   DIFFERENT visible tokens than forward path!
+  Model predicts: Position 8 should be [r5]
+  
+Loss Calculation:
+  Extracts logits at positions [8] (where masked_indices_rev=True)
+  Compares with ground truth [r5]
+  Computes cross-entropy loss
+```
+
+### Key Observation
+
+```
+Forward path:     predicts positions [7, 9]   with visible context [..., r1, [M], r2, [M], ...]
+Complementary:    predicts positions [8]      with visible context [..., r1, r3, r2, r4, ...]
+
+Different input_ids                                    Different context
+↓                                                      ↓
+noisy_batch != noisy_batch_rev                        logits != logits_rev
+↓                                                      ↓
+Different learning signals!                           Model sees diverse contexts!
+```
+
+---
+
+## Part 6: Why Called "Complementary"?
+
+```
+masked_indices     : [positions that are TRUE]  = {7, 9}
+masked_indices_rev : [positions that are TRUE]  = {8}
+
+Intersection: {} (empty!)
+Union: {7, 8, 9} (all positions in block)
+
+They are COMPLEMENTS of each other!
+- Forward + Complementary = All positions covered
+- Forward ∩ Complementary = Empty
+```
+
+---
+
+## Part 7: Summary Table
+
+| Aspect | Forward Path | Complementary Path |
+|--------|-------------|------------------|
+| **Mask Pattern** | `seg_mask` | `~seg_mask` |
+| **Masked Positions** | Positions where True | Different positions (where False) |
+| **Input** | `noisy_batch` | `noisy_batch_rev` |
+| **Model Output** | `logits` | `logits_rev` |
+| **Loss** | CE on masked positions | CE on OTHER positions |
+| **Context** | One specific arrangement | Inverse arrangement |
+| **Coverage** | Partial positions | Complementary positions |
+
+---
+
+## Key Takeaway
+
+```python
+# The magic is this one line:
+masked_indices_rev = ~seg_mask  # NOT operation
+
+# It creates two complementary training signals:
+# 1. Same model
+# 2. Same input_ids
+# 3. DIFFERENT mask patterns
+# 4. DIFFERENT loss signals
+# → More robust, more efficient, bidirectional learning
+```
+
+---
+
+## Implementation Checklist
+
+```
+✓ Create random mask pattern (seg_mask)
+✓ Use it for forward path (masked_indices = seg_mask)
+✓ Create inverse for rev path (masked_indices_rev = ~seg_mask)
+✓ Apply both masks to input_ids (torch.where)
+✓ Run two forward passes (one per masked version)
+✓ Calculate two sets of losses (forward and complementary)
+✓ Combine all losses
+✓ Backpropagate through both paths
+✓ Update model parameters
+```
+
+Done! The model now trained with full bidirectional understanding!
